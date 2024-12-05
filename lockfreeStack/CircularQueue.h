@@ -1,6 +1,6 @@
 #pragma once
 
-#define CQSIZE 5000
+#define CQSIZE 2000000
 
 #include <Windows.h>
 
@@ -26,7 +26,7 @@ public:
     }
 
     // 내용을 출력할 때 편하게 하려고 사용하는 함수. 평상시엔 사용하지 않음. 오로지 디버그 상황에서 출력하기 편하라도 사용.
-    T dequeue(void)
+    const T& dequeue(void)
     {
         if (!bDequeue)
         {
@@ -39,6 +39,8 @@ public:
 
         return queue[(deqeueCnt + 1) % capacity];
     }
+
+    UINT32 GetCount(void) { return count; }
 
 private:
     T queue[CQSIZE];           // 큐 배열

@@ -17,7 +17,7 @@ struct Node
 	T data;
 	Node<T>* pNext;
 
-	Node(T t) : data{ t }, pNext{ NULL } {};
+	Node(T t) : data{ t }, pNext{ NULL } {}
 };
 
 typedef struct _tagDebugNode {
