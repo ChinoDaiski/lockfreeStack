@@ -2,10 +2,14 @@
 #include <process.h>
 #include <iostream>
 #include <atomic>
-#include "CircularQueue.h"  // 기존 CircularQueue 헤더 포함 (FIFO 큐)
 #include <fstream>
 #include <iomanip>
 #pragma comment(lib, "Winmm.lib")
+
+
+#include "CircularQueue.h"  // 기존 CircularQueue 헤더 포함 (FIFO 큐)
+#include "MemoryPool.h"
+
 //
 //void handler(void);
 //
@@ -249,51 +253,6 @@
 #include <cstdint>
 #include <Windows.h>
 
-
-void handler();
-
-int filter(unsigned int code, struct _EXCEPTION_POINTERS* ep)
-{
-    puts("in filter.");
-    if (code == EXCEPTION_ACCESS_VIOLATION)
-    {
-        puts("caught AV as expected.");
-        return EXCEPTION_EXECUTE_HANDLER;
-    }
-    else
-    {
-        puts("didn't catch AV, unexpected.");
-        return EXCEPTION_CONTINUE_SEARCH;
-    };
-}
-
-
-
-enum class ACTION {
-    PUSH_BEFORE_CAS,
-    PUSH_AFTER_CAS,
-    POP_BEFORE_CAS,
-    POP_AFTER_CAS,
-    END
-};
-
-typedef struct _tagDebugNode {
-    long long pNode;        // 이전 노드 포인터
-    long long pNext;        // 다음 노드 포인터
-    ACTION action;          // 동작 유형 (PUSH, POP)
-    DWORD threadId;         // 스레드 ID
-    bool casSuccess;        // CAS 성공 여부
-    unsigned long long timestamp;    // 타임스탬프 (밀리초)
-
-    _tagDebugNode() {}
-    _tagDebugNode(long long a, long long b, ACTION _action, DWORD _threadId, bool _success, unsigned long long _timestamp)
-        : pNode{ a }, pNext{ b }, action{ _action }, threadId{ _threadId }, casSuccess{ _success }, timestamp{ _timestamp } {}
-} DebugNode, * PDebugNode;
-
-
-
-
-
 template <typename T>
 class LockFreeStack {
 private:
@@ -320,19 +279,9 @@ private:
         }
     };
 
-    UINT64 top; // Top을 나타내는 tagged pointer
-    UINT64 stamp; // 기준이 되는 stamp 값
-
-    // Compare-and-Swap for 64-bit tagged pointers
-//#define CAS(target, expected, desired) (InterlockedCompareExchange64(reinterpret_cast<LONG64*>(target), desired, expected) == expected);
     bool CAS(UINT64* target, UINT64 expected, UINT64 desired) {
         return InterlockedCompareExchange64(reinterpret_cast<LONG64*>(target), desired, expected) == expected;
     }
-
-public:
-    CircularQueue<DebugNode> queue;
-
-
 
 public:
     LockFreeStack() : top(0), stamp(0) {}
@@ -344,16 +293,14 @@ public:
 
     void Push(const T& value)
     {
-        Node* newNode = new Node{ value, nullptr }; 
+        Node* newNode = pool.Alloc();
+        newNode->data = value;
+
         Node* currentNode;
 
         UINT64 stValue = InterlockedIncrement(&stamp);
         UINT64 currentTop;
         UINT64 newTop;
-
-        bool casSuccess = false;
-
-        DWORD id = GetCurrentThreadId();
 
         while (true) {
             currentTop = top;
@@ -362,96 +309,52 @@ public:
             newNode->next = currentNode; // 새로운 노드의 next를 현재 top으로 설정
 
             newTop = AddressConverter::AddStamp(newNode, stValue);
-            
-            // 디버깅 정보 기록
-            queue.enqueue(DebugNode{
-                reinterpret_cast<long long>(currentNode),
-                reinterpret_cast<long long>(newNode),
-                ACTION::PUSH_BEFORE_CAS,
-                id,
-                casSuccess,
-                GetTickCount64()
-                });
 
-
-            casSuccess = CAS(&top, currentTop, newTop);
-
-            // 디버깅 정보 기록
-            queue.enqueue(DebugNode{
-                reinterpret_cast<long long>(currentNode),
-                reinterpret_cast<long long>(newNode),
-                ACTION::PUSH_AFTER_CAS,
-                id,
-                casSuccess,
-                GetTickCount64()
-                });
-
-            if (casSuccess) {
+            if (CAS(&top, currentTop, newTop)) {
                 break; // 성공적으로 Push 완료
             }
         }
     }
 
     bool Pop(T& value) {
-        Node* currentNode; 
+        Node* currentNode;
         Node* nextNode = nullptr;
-        UINT64 currentTop; 
+        UINT64 currentTop;
         UINT64 newTop;
         UINT64 stValue = InterlockedIncrement(&stamp);
 
+        while (true) {
+            currentTop = top;
+            currentNode = AddressConverter::ExtractNode(currentTop);
 
-        bool casSuccess;
-        DWORD id = GetCurrentThreadId();
+            if (!currentNode) {
+                return false; // 스택이 비어 있음
+            }
 
-        __try
-        {
-            while (true) {
-                currentTop = top;
-                currentNode = AddressConverter::ExtractNode(currentTop);
+            nextNode = currentNode->next;
+            newTop = AddressConverter::AddStamp(nextNode, stValue);
 
-                // 디버깅 정보 기록
-                queue.enqueue(DebugNode{
-                reinterpret_cast<long long>(currentNode),
-                reinterpret_cast<long long>(nextNode),
-                ACTION::POP_BEFORE_CAS,
-                id,
-                casSuccess,
-                timeGetTime()
-                    });
-
-                if (!currentNode) {
-                    return false; // 스택이 비어 있음
-                }
-
-                nextNode = currentNode->next;
-                newTop = AddressConverter::AddStamp(nextNode, stValue);
-
-                casSuccess = CAS(&top, currentTop, newTop);
-
-                // 디버깅 정보 기록
-                queue.enqueue(DebugNode{
-                reinterpret_cast<long long>(currentNode),
-                reinterpret_cast<long long>(nextNode),
-                ACTION::POP_AFTER_CAS,
-                id,
-                casSuccess,
-                timeGetTime()
-                    });
-
-                if (casSuccess) {
-                    value = currentNode->data;
-
-                    delete currentNode;
-                    return true; // 성공적으로 Pop 완료
-                }
+            if (CAS(&top, currentTop, newTop)) {
+                value = currentNode->data;
+                pool.Free(currentNode);
+                return true; // 성공적으로 Pop 완료
             }
         }
-        __except(filter(GetExceptionCode(), GetExceptionInformation()))
-        {
-            handler();
-        }
-
     }
+
+
+public:
+    UINT32 GetCurPoolCount(void) { return pool.GetCurPoolCount(); }
+    UINT32 GetMaxPoolCount(void) { return pool.GetMaxPoolCount(); }
+
+public:
+    //CircularQueue<DebugNode> queue;
+
+private:
+    UINT64 top; // Top을 나타내는 tagged pointer
+    UINT64 stamp; // 기준이 되는 stamp 값
+
+    MemoryPool<Node, false> pool;
 };
 
 
@@ -459,65 +362,67 @@ public:
 LockFreeStack<int> g_Stack;
 
 CRITICAL_SECTION cs;
+//
+//void handler()
+//{
+//    // 출력
+//    EnterCriticalSection(&cs);
+//
+//    // 디버깅 정보 출력
+//    DebugNode node;
+//
+//    std::ofstream outFile{ "debug_error.txt" };
+//
+//    if (!outFile)
+//        std::cerr << "파일 열기 실패...\n";
+//
+//    for (int i = 0; i < CQSIZE; ++i)
+//    {
+//        node = g_Stack.queue.dequeue();
+//
+//        outFile << std::dec << std::setw(5) << std::setfill('0') << i + 1 << ". Action: ";
+//        
+//        switch (node.action)
+//        {
+//        case ACTION::PUSH_BEFORE_CAS:
+//            outFile << "PUSH_BEFORE_CAS";
+//            break;
+//        case ACTION::PUSH_AFTER_CAS:
+//            outFile << "PUSH_AFTER_CAS";
+//            break;
+//        case ACTION::POP_BEFORE_CAS:
+//            outFile << "POP_BEFORE_CAS";
+//            break;
+//        case ACTION::POP_AFTER_CAS:
+//            outFile << "POP_AFTER_CAS";
+//            break;
+//        case ACTION::END:
+//            break;
+//        default:
+//            break;
+//        }
+//        
+//        outFile << ", Thread: " << node.threadId
+//            << ", CAS Success: " << (node.casSuccess ? "Yes" : "No")
+//            << ", Timestamp: " << node.timestamp
+//            << ", Old Node: " << std::hex << std::hex << node.pNode
+//            << ", New Node: " << std::hex << node.pNext
+//            << std::endl;
+//    }
+//
+//    outFile.close();
+//
+//    exit(-1);
+//}
 
-void handler()
-{
-    // 출력
-    EnterCriticalSection(&cs);
-
-    // 디버깅 정보 출력
-    DebugNode node;
-
-    std::ofstream outFile{ "debug_error.txt" };
-
-    if (!outFile)
-        std::cerr << "파일 열기 실패...\n";
-
-    for (int i = 0; i < CQSIZE; ++i)
-    {
-        node = g_Stack.queue.dequeue();
-
-        outFile << std::dec << std::setw(5) << std::setfill('0') << i + 1 << ". Action: ";
-        
-        switch (node.action)
-        {
-        case ACTION::PUSH_BEFORE_CAS:
-            outFile << "PUSH_BEFORE_CAS";
-            break;
-        case ACTION::PUSH_AFTER_CAS:
-            outFile << "PUSH_AFTER_CAS";
-            break;
-        case ACTION::POP_BEFORE_CAS:
-            outFile << "POP_BEFORE_CAS";
-            break;
-        case ACTION::POP_AFTER_CAS:
-            outFile << "POP_AFTER_CAS";
-            break;
-        case ACTION::END:
-            break;
-        default:
-            break;
-        }
-        
-        outFile << ", Thread: " << node.threadId
-            << ", CAS Success: " << (node.casSuccess ? "Yes" : "No")
-            << ", Timestamp: " << node.timestamp
-            << ", Old Node: " << std::hex << std::hex << node.pNode
-            << ", New Node: " << std::hex << node.pNext
-            << std::endl;
-    }
-
-    outFile.close();
-
-    exit(-1);
-}
-
+bool bExitWorker = false;
+bool bExitMonitor = false;
 
 // 작업자 스레드 함수
 unsigned int WINAPI Worker(void* pArg) {
-    int cnt = 5000;// rand() % 1000;
+    const int cnt = 10000;// rand() % 1000;
 
-    while (1) {
+    while (!bExitWorker) {
         for (int i = 0; i < cnt; ++i) {
             g_Stack.Push(i);
         }
@@ -526,8 +431,8 @@ unsigned int WINAPI Worker(void* pArg) {
         for (int i = 0; i < cnt; ++i) {
             if (!g_Stack.Pop(value))
             {
-                break;
-                //DebugBreak();
+                //break;
+                DebugBreak();
                 //handler();
                 //throw std::exception();
             }
@@ -538,6 +443,27 @@ unsigned int WINAPI Worker(void* pArg) {
 }
 
 
+
+
+
+// 인자로 받은 서버의 TPS 및 보고 싶은 정보를 1초마다 감시하는 스레드
+unsigned int WINAPI MonitorThread(void* pArg)
+{
+    while (!bExitMonitor)
+    {
+        std::cout << "===================================\n";
+
+        std::cout << "CurPoolCount : " << g_Stack.GetCurPoolCount() << "\n";
+        std::cout << "MaxPoolCount : " << g_Stack.GetMaxPoolCount() << "\n";
+
+        std::cout << "===================================\n\n";
+
+        // 1초간 Sleep
+        Sleep(1000);
+    }
+
+    return 0;
+}
 
 
 
@@ -552,14 +478,41 @@ int main(void) {
 
     InitializeCriticalSection(&cs);
 
-    const int ThreadCnt = 2;
-    HANDLE hHandle[ThreadCnt];
+    const int ThreadCnt = 4;
+    HANDLE hHandle[ThreadCnt + 1];
 
-    for (int i = 0; i < ThreadCnt; ++i) {
+    for (int i = 1; i <= ThreadCnt; ++i) {
         hHandle[i] = (HANDLE)_beginthreadex(NULL, 0, Worker, NULL, 0, NULL);
     }
+    // 모니터 스레드 생성
+    hHandle[0] = (HANDLE)_beginthreadex(NULL, 0, MonitorThread, NULL, 0, NULL);
 
-    WaitForMultipleObjects(ThreadCnt, hHandle, TRUE, INFINITE);
+    WCHAR ControlKey;
+
+    while (1)
+    {
+        ControlKey = _getwch();
+        if (ControlKey == L'q' || ControlKey == L'Q')
+        {
+            bExitWorker = true;
+            break;
+        }
+    }
+
+    WaitForMultipleObjects(ThreadCnt, &hHandle[1], TRUE, INFINITE);
+
+    bExitMonitor = true;
+
+    WaitForSingleObject(hHandle[0], INFINITE);
+
+
+    std::cout << "===================================\n";
+
+    std::cout << "CurPoolCount : " << g_Stack.GetCurPoolCount() << "\n";
+    std::cout << "MaxPoolCount : " << g_Stack.GetMaxPoolCount() << "\n";
+
+    std::cout << "===================================\n\n";
+    std::cout << "프로세스 종료" << "\n";
 
     return 0;
 }

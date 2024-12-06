@@ -29,5 +29,8 @@
     <ClInclude Include="CircularQueue.h">
       <Filter>소스 파일\CircularQueue</Filter>
     </ClInclude>
+    <ClInclude Include="MemoryPool.h">
+      <Filter>헤더 파일</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
