@@ -32,5 +32,8 @@
     <ClInclude Include="MemoryPool.h">
       <Filter>헤더 파일</Filter>
     </ClInclude>
+    <ClInclude Include="concurrent_stack.h">
+      <Filter>소스 파일</Filter>
+    </ClInclude>
   </ItemGroup>
 </Project>
